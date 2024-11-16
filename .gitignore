@@ -1,2 +1,4 @@
 *.lock
 .aider*
+02-block-pick-and-place/pick_n_place.egg-info
+02-block-pick-and-place/pick_n_place/MUJOCO_LOG.TXT
