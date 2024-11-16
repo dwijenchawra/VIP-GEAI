@@ -72,6 +72,9 @@ def main(sim_path, horizon):
             # Box pose in Global Frame
             box_pos = sim.data.xpos[box_sid]  # cartesian position
             box_mat = sim.data.xmat[box_sid]  # rotation matrix
+            
+            box_mat = -box_mat # flip the box
+            box_quat = mat2quat(box_mat.reshape(3, 3))
 
             # propagage targets to the sim for viz (ONLY FOR VISUALIZATION)
             sim.model.site_pos[target_sid][:] = target_pos - np.array([0, 0, BIN_TOP])
@@ -87,8 +90,8 @@ def main(sim_path, horizon):
             ik_result = qpos_from_site_pose(
                 physics=sim,
                 site_name="end_effector",
-                target_pos=target_pos,  # change!
-                target_quat=target_quat,  # change!
+                target_pos=box_pos,
+                target_quat=box_quat,
                 inplace=False,
                 regularization_strength=1.0,
             )
@@ -98,6 +101,21 @@ def main(sim_path, horizon):
                     ik_result.success, ik_result.steps, ik_result.err_norm
                 )
             )
+            
+            if not ik_result.success:
+                print("IK failed, resampling target")
+                break
+            
+            print("target_sid:", target_sid)
+            print("sim.data.xpos:", sim.data.xpos)
+
+            print("box_pos:", box_pos)
+            print("box_quat:", box_quat)            
+            print("arm initial pos:", ARM_JNT0)
+            print("arm target pos:", ik_result.qpos[:ARM_nJnt])
+            print("ttg:", horizon) 
+            print("dt:", sim.model.opt.timestep)
+            
 
             # generate min jerk trajectory
             waypoints = generate_joint_space_min_jerk(
