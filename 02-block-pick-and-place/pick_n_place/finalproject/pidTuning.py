@@ -24,12 +24,11 @@ from mpl_toolkits.mplot3d import Axes3D
 import click
 import numpy as np
 from robohive.utils.min_jerk import generate_joint_space_min_jerk
-from scipy.interpolate import splprep, splev
+from scipy.interpolate import splprep, splev, CubicSpline
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import RotationSpline
+from tqdm import tqdm
 from time import sleep
-import mujoco
-
 
 TARGET_BIN_POS = np.array([0.235, 0.5, 0.85])
 BOX_BIN_POS = np.array([-0.235, 0.5, 0.85])
@@ -203,18 +202,18 @@ def move_arm_with_pose(sim: SimScene, start_pos, start_mat, target_pos, target_m
         # i want to print the orientation of the end effector on the sim
         # mj = sim.get_mjlib()
         # mj.mju_printMat(sim.data.xmat[sim.model.site_name2id("end_effector")].reshape(9), 3)
-
+    
 
 import threading
 from matplotlib.gridspec import GridSpec
 class PIDController:
-    def __init__(self, kp, ki, kd, max_output=10000):
+    def __init__(self, kp, ki, kd):
         self.kp = kp
         self.ki = ki
         self.kd = kd
         self.integral = 0
         self.prev_error = 0
-        self.max_output = max_output
+        self.target = 0
         
     def set_target(self, target):
         self.target = target
@@ -224,8 +223,8 @@ class PIDController:
         self.integral += error * dt
         derivative = (error - self.prev_error) / dt
         self.prev_error = error
-        out = self.kp * error + self.ki * self.integral + self.kd * derivative
-        return min(max(out, -self.max_output), self.max_output)
+        return self.kp * error + self.ki * self.integral + self.kd * derivative
+    
     def reset(self):
         self.integral = 0
         self.prev_error = 0
@@ -235,19 +234,33 @@ class PIDController:
         return self.prev_error
 
 class PIDArm:
-    def __init__(self, sim: SimScene, kp, ki, kd, max_output, eff_name="end_effector"):
+    def __init__(self, sim: SimScene, kp, ki, kd, eff_name="end_effector"):
         self.sim = sim
         self.eff_name = eff_name
-        self.pid_controllers = [PIDController(kp[i], ki[i], kd[i], max_output[i]) for i in range(ARM_nJnt)]
+        self.pid_controllers = [PIDController(kp, ki, kd) for _ in range(ARM_nJnt)]
         self.current_values = [[] for _ in range(ARM_nJnt)]  # Store current values for plotting
         self.joint_min = sim.model.jnt_range[:, 0]
         self.joint_max = sim.model.jnt_range[:, 1]
         self.curr_eef_coords = []
         self.target_eef_coords = []
         self.pid_controller_targets = []
-        self.plot_thread = threading.Thread(target=self.plot_current_values_2d)
-        self.plot_thread.start()  # Start the plotting thread
-
+        # self.plot_thread = threading.Thread(target=self.plot_current_values_2d)
+        # self.plot_thread.start()  # Start the plotting thread
+        
+        self.default_positions = np.mean(sim.model.jnt_range[:ARM_nJnt], axis=-1)
+    
+    def pid_tune(self, joint_index, kp, ki, kd, target):
+        self.pid_controllers[joint_index].kp = kp
+        self.pid_controllers[joint_index].ki = ki
+        self.pid_controllers[joint_index].kd = kd
+        self.pid_controllers[joint_index].set_target(target)
+        
+        while True:
+            # just update the pid controller
+            control_signal = self.pid_controllers[joint_index].update(self.sim.data.qpos[joint_index], self.sim.model.opt.timestep)
+            self.sim.data.qfrc_applied[joint_index] = control_signal
+            self.sim.advance(substeps=1, render=True)
+        
     def set_target(self, sim, targetPos, targetMat):
         # convert to joint space (solve IK)
         targetQuat = mat2quat(targetMat.reshape(3, 3))
@@ -347,47 +360,107 @@ def move_arm_PID(arm: PIDArm, sim: SimScene, target_pos, target_mat, time=5, hz=
         dt = sim.model.opt.timestep  # Get the time step
         arm.update(sim, current_joint_positions, dt)  # Update the PID controller
         sim.advance(substeps=1, render=True)  # Advance the simulation
-        
-def move_arm_spline_PID(arm: PIDArm, sim: SimScene, start_pos, start_mat, end_pos, end_mat, 
-                        waypoints=None, tracking_error=0.01, time=5, hz=500, num_intermediate_points=100):
-    '''
-    create a spline from start to end, with waypoints
-    generate intermediate points from spline for PID control
+
+def move_arm_manual(arm: PIDArm, sim: SimScene, joint_positions, time=5, hz=500):
+    for _ in range(time * hz):
+        arm.update(sim, joint_positions, sim.model.opt.timestep)  # Update the PID controller
+        sim.advance(substeps=1, render=True)  # Advance the simulation
+
+# def move_arm_spline_PID(arm: PIDArm, sim: SimScene, start_pos, start_mat, end_pos, end_mat, 
+#                         waypoints=None, tracking_error=0.01, time=5, hz=500, num_intermediate_points=100):
+#     '''
+#     create a spline from start to end, with waypoints
+#     generate intermediate points from spline for PID control
     
-    logic:
-    - arm is at start
-    - create array of 3d points to use as spline points
-    - fit spline to points
-    - generate intermediate points from spline
-    - use PID to move to each intermediate point
-        - if tracking error is less than threshold, set targets to next point's IK solution
-    - repeat until end point is reached
-    '''
+#     logic:
+#     - arm is at start
+#     - create array of 3d points to use as spline points
+#     - fit spline to points
+#     - generate intermediate points from spline
+#     - use PID to move to each intermediate point
+#         - if tracking error is less than threshold, set targets to next point's IK solution
+#     - repeat until end point is reached
+#     '''
     
+#     pointsArr = [start_pos]
+#     if waypoints is not None:
+#         pointsArr.extend(waypoints)
+#     pointsArr.append(end_pos)
+    
+#     # fit spline to points
+#     tck, u = splprep(pointsArr, s=2) # tck and u are the knots and the parameters
+    
+#     # generate intermediate points from spline
+#     intermediate_times = np.linspace(0, time, num_intermediate_points)
+#     intermediate_points = splev(intermediate_times, tck)
+    
+#     # plot the spline
+#     fig2 = plt.figure(2)
+#     ax3d = fig2.add_subplot(111, projection='3d')
+#     ax3d.plot(pointsArr[0][0], pointsArr[0][1], pointsArr[0][2], 'b')
+#     ax3d.plot(pointsArr[-1][0], pointsArr[-1][1], pointsArr[-1][2], 'r')
+#     ax3d.plot(intermediate_points[0], intermediate_points[1], intermediate_points[2], 'g')
+#     fig2.show()
+#     plt.show()
+#     sleep(10)
+    
+    
+#     # convert start and end rotation matrices to quaternions, and then to Rotation objects
+#     start_quat = mat2quat(start_mat.reshape(3, 3))
+#     end_quat = mat2quat(end_mat.reshape(3, 3))
+#     rot = R.from_quat([start_quat, end_quat])
+    
+#     # now use the rotation spline to interpolate between start and end rotations
+#     # NOTE: why this works
+#     # the position is the only thing that can have a waypoints
+#     # rotation just needs to match start and end
+#     rotation_spline = RotationSpline(intermediate_times, rot)
+
+def plotPositions3D(positions):
+    '''
+    takes in a list of N positions, and plots them in 3d
+    '''
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    for pos in positions:
+        ax.plot(pos[0], pos[1], pos[2], 'bo')
+    plt.show()
+
+
+"""
+this function just takes start, end, waypoints
+and gets a spline through the positions
+it also interpolates the rotations between start and end
+then just moves the arm to the intermediate points
+"""
+def move_arm_spline_TASK_SPACE(sim: SimScene, start_pos, start_mat, end_pos, end_mat, waypoints=None, time=5, hz=500):
     pointsArr = [start_pos]
     if waypoints is not None:
         pointsArr.extend(waypoints)
     pointsArr.append(end_pos)
     
+    print("pointsArr:", pointsArr)
+    print("len(pointsArr):", len(pointsArr))
+    
+    x_points = [p[0] for p in pointsArr]
+    y_points = [p[1] for p in pointsArr]
+    z_points = [p[2] for p in pointsArr]
+    
     # fit spline to points
-    tck, u = splprep(pointsArr, s=2) # tck and u are the knots and the parameters
+    tck, u = splprep([x_points, y_points, z_points]) # tck and u are the knots and the parameters
     
-    # generate intermediate points from spline
-    intermediate_times = np.linspace(0, time, num_intermediate_points)
-    intermediate_points = splev(intermediate_times, tck)
+    # temp code
+    new_points = splev(np.linspace(0, 1, time*hz), tck)
+    plotPositions3D(np.array(new_points).T)
+    int_x, int_y, int_z = new_points
     
-    # plot the spline
-    fig2 = plt.figure(2)
-    ax3d = fig2.add_subplot(111, projection='3d')
-    ax3d.plot(pointsArr[0][0], pointsArr[0][1], pointsArr[0][2], 'b')
-    ax3d.plot(pointsArr[-1][0], pointsArr[-1][1], pointsArr[-1][2], 'r')
-    ax3d.plot(intermediate_points[0], intermediate_points[1], intermediate_points[2], 'g')
-    fig2.show()
-    plt.show()
-    sleep(10)
+    # generate intermediate points from splines
+    intermediate_times = np.linspace(0, 1, time*hz)
+    # int_x, int_y, int_z = splev(intermediate_times, tck)
     
+    plotPositions3D(np.array([int_x, int_y, int_z]).T)
     
-    # convert start and end rotation matrices to quaternions, and then to Rotation objects
+    # interpolate the rotation matrices
     start_quat = mat2quat(start_mat.reshape(3, 3))
     end_quat = mat2quat(end_mat.reshape(3, 3))
     rot = R.from_quat([start_quat, end_quat])
@@ -396,8 +469,90 @@ def move_arm_spline_PID(arm: PIDArm, sim: SimScene, start_pos, start_mat, end_po
     # NOTE: why this works
     # the position is the only thing that can have a waypoints
     # rotation just needs to match start and end
-    rotation_spline = RotationSpline(intermediate_times, rot)
+    rotation_spline = RotationSpline([0, 1], rot)
+    
+    # print the first 5 position and rotation matrices
+    for i in range(5):
+        print("position:", np.array([int_x[i], int_y[i], int_z[i]]))
+        print("rotation:", rotation_spline(intermediate_times[i]).as_matrix())
+    
+    # for each point on the trajectory, calculate the IK solution
+    joint_waypoints = []
+    for i in tqdm(range(len(intermediate_times))):
+        target_pos = np.array([int_x[i], int_y[i], int_z[i]])
+        target_quat = rotation_spline(intermediate_times[0]).as_quat()
+        ik_result = qpos_from_site_pose(
+            physics=sim,
+            site_name="end_effector",
+            target_pos=target_pos,
+            target_quat=target_quat,
+            inplace=False,
+            max_steps=1000,
+            regularization_strength=1.0,
+        )
+        joint_waypoints.append(ik_result.qpos[:ARM_nJnt])
+        
+    # plot the trajectory
+    xyz = np.array([int_x, int_y, int_z]).T
+    # plotTrajectory(start_pos, end_pos, xyz, [rotation_spline(intermediate_times[i]).as_matrix() for i in range(len(intermediate_times))])
+    
+    for i in tqdm(range(len(joint_waypoints))):
+        sim.data.ctrl[:ARM_nJnt] = joint_waypoints[i]
+        sim.advance(render=True)
+        sleep(1/hz)
 
+def move_arm_spline_JOINT_SPACE(sim: SimScene, start_pos, start_mat, end_pos, end_mat, waypoints=None, time=5, hz=500):
+    pointsArr = [start_pos]
+    if waypoints is not None:
+        pointsArr.extend(waypoints)
+    pointsArr.append(end_pos)
+    
+    # interpolate rotation for the waypoints
+    start_quat = mat2quat(start_mat.reshape(3, 3))
+    end_quat = mat2quat(end_mat.reshape(3, 3))
+    # rot = R.from_quat([start_quat, end_quat])
+    # rotation_spline = RotationSpline([0, 1], rot)
+
+    # rotArr = [rotation_spline(i).as_matrix() for i in range(len(pointsArr))]
+    
+    timeArr = np.linspace(0, time, len(pointsArr))
+
+    # calculate IK for each intermediate step
+    joint_values = [] # array of arrays, each inner array is the joint values at a given time
+    
+    for i in range(len(pointsArr)):
+        target_pos = pointsArr[i]
+        target_quat = mat2quat(start_mat.reshape(3, 3))
+        ik_result = qpos_from_site_pose(
+            physics=sim,
+            site_name="end_effector",
+            target_pos=target_pos,
+            target_quat=target_quat,
+            inplace=False,
+            max_steps=1000,
+            regularization_strength=1.0,
+        )
+        joint_values.append(ik_result.qpos[:ARM_nJnt])
+    
+    int_times = time*hz
+    final_values = []
+    joint_splines = []
+    # now create a spline for each of the joints
+    for i in range(ARM_nJnt):
+        spl = CubicSpline(timeArr, [j[i] for j in joint_values])
+        joint_splines.append(spl)
+
+    # spline is made, now sample intermediate times to get new joint positions
+    # Sample intermediate points from the spline
+    intermediate_times = np.linspace(0, time, int_times)
+    final_values = [joint_splines[i](intermediate_times) for i in range(ARM_nJnt)]
+    # transpose final_values to get the joint values at each time step
+    final_values = np.array(final_values).T
+    
+    for i in tqdm(range(len(final_values))):
+        sim.data.ctrl[:ARM_nJnt] = final_values[i]
+        sim.advance(substeps=1, render=True)
+        sleep(1/hz)
 
 
 
@@ -436,74 +591,67 @@ def main(sim_path, horizon):
     target_sid = sim.model.site_name2id("drop_target")
     box_sid = sim.model.body_name2id("box")
     
-    init_targets(sim, target_sid, box_sid)
-    
-    '''      gains:
-    panda_joint1: { p: 12000, d: 50, i: 0.0, i_clamp: 10000 }
-    panda_joint2: { p: 30000, d: 100, i: 0.02, i_clamp: 10000 }
-    panda_joint3: { p: 18000, d: 50, i: 0.01, i_clamp: 1 }
-    panda_joint4: { p: 18000, d: 70, i: 0.01, i_clamp: 10000 }
-    panda_joint5: { p: 12000, d: 70, i: 0.01, i_clamp: 1 }
-    panda_joint6: { p: 7000, d: 50, i: 0.01, i_clamp: 1 }
-    panda_joint7: { p: 2000, d: 20, i: 0.0, i_clamp: 1 }
-
-'''
-
-    pid_arm = PIDArm(sim, kp=[12000, 30000, 18000, 18000, 12000, 7000, 2000], 
-                     ki=[0, 0.02, 0.01, 0.01, 0.01, 0.01, 0], 
-                     kd=[50, 100, 50, 70, 70, 50, 20],
-                     max_output=[87, 87, 87, 87, 12, 12, 12])
-    
-    # pid_arm = PIDArm(sim, kp=[600, 600, 600, 600, 250, 150, 50], 
-    #              ki=[0, 0, 0, 0, 0, 0, 0], 
-    #              kd=[30, 30, 30, 30, 10, 10, 5],
-    #              max_output=[87, 87, 87, 87, 12, 12, 12])
-
-    # every second, print error to target
-    prev_time = 0
 
     while True:
-        # current_joint_positions = sim.data.qpos[:ARM_nJnt]  # Get current joint positions
-        # dt = sim.model.opt.timestep  # Get the time step
-        # pid_arm.update(sim, current_joint_positions, dt)  # Update the PID controller
-        # sim.advance(substeps=1, render=True)  # Advance the simulation
-        # if sim.data.time - prev_time > 1:
-        #     print("Error to target:", pid_arm.error_to_target())
-        #     prev_time = sim.data.time
-        
         init_targets(sim, target_sid, box_sid)
-        open_gripper(sim)
         
-        # Calculate position above the box
-        pos_above, mat_above = calculate_pos_above(sim, "box", 0.02)
-        # Move arm to the position above the box using PID control
-        print("Moving arm to the position above the box")
-        move_arm_PID(pid_arm, sim, pos_above, mat_above, time=3, hz=500)
-
-        # now move to the box
-        print("Moving arm to the box")
-        box_sid, box_pos, box_mat = get_id_pos_rot(sim, "box")
-        move_arm_PID(pid_arm, sim, box_pos, box_mat, time=3, hz=500)
+        # pos_above, mat_above = calculate_pos_above(sim, "box")
         
-        # close the gripper
-        print("Closing the gripper")
-        close_gripper(sim)
+        # # set arm initial position to above the box
+        # # ik to pos above
+        # ik_result = qpos_from_site_pose(
+        #     physics=sim,
+        #     site_name="end_effector",
+        #     target_pos=pos_above,
+        #     target_quat=None,
+        #     inplace=False,
+        #     regularization_strength=1.0,
+        # )
+        # sim.data.qpos[:ARM_nJnt] = ik_result.qpos[:ARM_nJnt]
+        # sim.advance(render=True)
+        
+        # # pick target
+        # pick_pos, pick_mat = sim.data.site_xpos[sim.model.site_name2id("pick_target")], sim.data.site_xmat[sim.model.site_name2id("pick_target")]
+        # # drop target
+        # drop_pos, drop_mat = sim.data.site_xpos[sim.model.site_name2id("drop_target")], sim.data.site_xmat[sim.model.site_name2id("drop_target")]
 
-        # Move arm to pick target using PID control
-        _, pick_target_pos, pick_target_mat = get_id_pos_rot(sim, "pick_target")
-        print("Moving arm to pick target")
-        move_arm_PID(pid_arm, sim, pick_target_pos, pick_target_mat, time=3, hz=500)
-
-        # move to drop target
-        pos_above, mat_above = calculate_pos_above(sim, "drop_target", 0.1)
-        print("Moving arm to drop target")
-        move_arm_PID(pid_arm, sim, pos_above, mat_above, time=2, hz=500)
-
-        # open the gripper
-        print("Opening the gripper")
-        open_gripper(sim)
-
+        # plan is move from start, to "pick_target", to "drop_target" using a spline
+        # move_arm_spline_TASK_SPACE(sim, pos_above, mat_above, drop_pos, drop_mat, waypoints=[pick_pos, [0.  , 0.65 , 1.75]], time=5, hz=500)
+        
+        # create a grid of 9 points
+        points = [
+            [-0.5  , 0.65 , 1.75],
+            [0  , 0.65 , 1.75],
+            [0.5  , 0.65 , 1.75],
+            [0.5  , 0.65 , 1.5],
+            [0.  , 0.65 , 1.5],
+            [-0.5  , 0.65 , 1.5],
+            [-0.5  , 0.65 , 1.25],
+            [0.  , 0.65 , 1.25],
+            [0.5 , 0.65 , 1.25]
+        ]
+        
+        # move arm to first point
+        ik_result = qpos_from_site_pose(
+            physics=sim,
+            site_name="end_effector",
+            target_pos=points[0],
+            target_quat=mat2quat(sim.data.xmat[sim.model.body_name2id("box")].reshape(3, 3)),
+            inplace=False,
+            regularization_strength=1.0,
+        )
+        sim.data.qpos[:ARM_nJnt] = ik_result.qpos[:ARM_nJnt]
+        sim.advance(render=True)
+        
+        start_pos = points[0]
+        start_rot = sim.data.xmat[sim.model.body_name2id("box")].reshape(3, 3)
+        end_pos = points[-1]
+        end_rot = sim.data.xmat[sim.model.body_name2id("box")].reshape(3, 3)
+        
+        move_arm_spline_JOINT_SPACE(sim, start_pos, start_rot, end_pos, end_rot, waypoints=points[1:-1], time=5, hz=500)
+        # move_arm_spline_TASK_SPACE(sim, start_pos, start_rot, end_pos, end_rot, waypoints=points[1:-1], time=5, hz=500)
         sim.reset()
+        
 
 if __name__ == "__main__":
     main()
